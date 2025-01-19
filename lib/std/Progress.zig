@@ -23,17 +23,13 @@ redraw_event: std.Thread.ResetEvent,
 /// Indicates a request to shut down and reset global state.
 /// Accessed atomically.
 done: bool,
+need_clear: bool,
 
 refresh_rate_ns: u64,
 initial_delay_ns: u64,
 
 rows: u16,
 cols: u16,
-/// Tracks the number of newlines that have been actually written to the terminal.
-written_newline_count: u16,
-/// Tracks the number of newlines that will be written to the terminal if the
-/// draw buffer is sent.
-accumulated_newline_count: u16,
 
 /// Accessed only by the update thread.
 draw_buffer: []u8,
@@ -84,6 +80,8 @@ pub const Options = struct {
 pub const Node = struct {
     index: OptionalIndex,
 
+    pub const none: Node = .{ .index = .none };
+
     pub const max_name_len = 40;
 
     const Storage = extern struct {
@@ -92,13 +90,13 @@ pub const Node = struct {
         /// 0 means unknown.
         /// Little endian.
         estimated_total_count: u32,
-        name: [max_name_len]u8,
+        name: [max_name_len]u8 align(@alignOf(usize)),
 
         /// Not thread-safe.
         fn getIpcFd(s: Storage) ?posix.fd_t {
             return if (s.estimated_total_count == std.math.maxInt(u32)) switch (@typeInfo(posix.fd_t)) {
-                .Int => @bitCast(s.completed_count),
-                .Pointer => @ptrFromInt(s.completed_count),
+                .int => @bitCast(s.completed_count),
+                .pointer => @ptrFromInt(s.completed_count),
                 else => @compileError("unsupported fd_t of " ++ @typeName(posix.fd_t)),
             } else null;
         }
@@ -106,8 +104,8 @@ pub const Node = struct {
         /// Thread-safe.
         fn setIpcFd(s: *Storage, fd: posix.fd_t) void {
             const integer: u32 = switch (@typeInfo(posix.fd_t)) {
-                .Int => @bitCast(fd),
-                .Pointer => @intFromPtr(fd),
+                .int => @bitCast(fd),
+                .pointer => @intFromPtr(fd),
                 else => @compileError("unsupported fd_t of " ++ @typeName(posix.fd_t)),
             };
             // `estimated_total_count` max int indicates the special state that
@@ -181,16 +179,17 @@ pub const Node = struct {
     pub fn start(node: Node, name: []const u8, estimated_total_items: usize) Node {
         if (noop_impl) {
             assert(node.index == .none);
-            return .{ .index = .none };
+            return Node.none;
         }
-        const node_index = node.index.unwrap() orelse return .{ .index = .none };
+        const node_index = node.index.unwrap() orelse return Node.none;
         const parent = node_index.toParent();
 
         const freelist_head = &global_progress.node_freelist_first;
         var opt_free_index = @atomicLoad(Node.OptionalIndex, freelist_head, .seq_cst);
         while (opt_free_index.unwrap()) |free_index| {
             const freelist_ptr = freelistByIndex(free_index);
-            opt_free_index = @cmpxchgWeak(Node.OptionalIndex, freelist_head, opt_free_index, freelist_ptr.*, .seq_cst, .seq_cst) orelse {
+            const next = @atomicLoad(Node.OptionalIndex, freelist_ptr, .seq_cst);
+            opt_free_index = @cmpxchgWeak(Node.OptionalIndex, freelist_head, opt_free_index, next, .seq_cst, .seq_cst) orelse {
                 // We won the allocation race.
                 return init(free_index, parent, name, estimated_total_items);
             };
@@ -200,7 +199,7 @@ pub const Node = struct {
         if (free_index >= global_progress.node_storage.len) {
             // Ran out of node storage memory. Progress for this node will not be tracked.
             _ = @atomicRmw(u32, &global_progress.node_end_index, .Sub, 1, .monotonic);
-            return .{ .index = .none };
+            return Node.none;
         }
 
         return init(@enumFromInt(free_index), parent, name, estimated_total_items);
@@ -251,7 +250,7 @@ pub const Node = struct {
             const freelist_head = &global_progress.node_freelist_first;
             var first = @atomicLoad(Node.OptionalIndex, freelist_head, .seq_cst);
             while (true) {
-                freelistByIndex(index).* = first;
+                @atomicStore(Node.OptionalIndex, freelistByIndex(index), first, .seq_cst);
                 first = @cmpxchgWeak(Node.OptionalIndex, freelist_head, first, index.toOptional(), .seq_cst, .seq_cst) orelse break;
             }
         } else {
@@ -271,6 +270,19 @@ pub const Node = struct {
         storageByIndex(index).setIpcFd(fd);
     }
 
+    /// Posix-only. Thread-safe. Assumes the node is storing an IPC file
+    /// descriptor.
+    pub fn getIpcFd(node: Node) ?posix.fd_t {
+        const index = node.index.unwrap() orelse return null;
+        const storage = storageByIndex(index);
+        const int = @atomicLoad(u32, &storage.completed_count, .monotonic);
+        return switch (@typeInfo(posix.fd_t)) {
+            .int => @bitCast(int),
+            .pointer => @ptrFromInt(int),
+            else => @compileError("unsupported fd_t of " ++ @typeName(posix.fd_t)),
+        };
+    }
+
     fn storageByIndex(index: Node.Index) *Node.Storage {
         return &global_progress.node_storage[@intFromEnum(index)];
     }
@@ -284,16 +296,15 @@ pub const Node = struct {
     }
 
     fn init(free_index: Index, parent: Parent, name: []const u8, estimated_total_items: usize) Node {
-        assert(parent != .unused);
+        assert(parent == .none or @intFromEnum(parent) < node_storage_buffer_len);
 
         const storage = storageByIndex(free_index);
-        storage.* = .{
-            .completed_count = 0,
-            .estimated_total_count = std.math.lossyCast(u32, estimated_total_items),
-            .name = [1]u8{0} ** max_name_len,
-        };
+        @atomicStore(u32, &storage.completed_count, 0, .monotonic);
+        @atomicStore(u32, &storage.estimated_total_count, std.math.lossyCast(u32, estimated_total_items), .monotonic);
         const name_len = @min(max_name_len, name.len);
-        @memcpy(storage.name[0..name_len], name[0..name_len]);
+        copyAtomicStore(storage.name[0..name_len], name[0..name_len]);
+        if (name_len < storage.name.len)
+            @atomicStore(u8, &storage.name[name_len], 0, .monotonic);
 
         const parent_ptr = parentByIndex(free_index);
         assert(parent_ptr.* == .unused);
@@ -312,10 +323,9 @@ var global_progress: Progress = .{
     .initial_delay_ns = undefined,
     .rows = 0,
     .cols = 0,
-    .written_newline_count = 0,
-    .accumulated_newline_count = 0,
     .draw_buffer = undefined,
     .done = false,
+    .need_clear = false,
 
     .node_parents = &node_parents_buffer,
     .node_storage = &node_storage_buffer,
@@ -324,7 +334,7 @@ var global_progress: Progress = .{
     .node_end_index = 0,
 };
 
-const node_storage_buffer_len = 200;
+const node_storage_buffer_len = 83;
 var node_parents_buffer: [node_storage_buffer_len]Node.Parent = undefined;
 var node_storage_buffer: [node_storage_buffer_len]Node.Storage = undefined;
 var node_freelist_buffer: [node_storage_buffer_len]Node.OptionalIndex = undefined;
@@ -332,6 +342,11 @@ var node_freelist_buffer: [node_storage_buffer_len]Node.OptionalIndex = undefine
 var default_draw_buffer: [4096]u8 = undefined;
 
 var debug_start_trace = std.debug.Trace.init;
+
+pub const have_ipc = switch (builtin.os.tag) {
+    .wasi, .freestanding, .windows => false,
+    else => true,
+};
 
 const noop_impl = builtin.single_threaded or switch (builtin.os.tag) {
     .wasi, .freestanding => true,
@@ -362,27 +377,27 @@ pub fn start(options: Options) Node {
     global_progress.initial_delay_ns = options.initial_delay_ns;
 
     if (noop_impl)
-        return .{ .index = .none };
+        return Node.none;
 
     if (std.process.parseEnvVarInt("ZIG_PROGRESS", u31, 10)) |ipc_fd| {
         global_progress.update_thread = std.Thread.spawn(.{}, ipcThreadRun, .{
             @as(posix.fd_t, switch (@typeInfo(posix.fd_t)) {
-                .Int => ipc_fd,
-                .Pointer => @ptrFromInt(ipc_fd),
+                .int => ipc_fd,
+                .pointer => @ptrFromInt(ipc_fd),
                 else => @compileError("unsupported fd_t of " ++ @typeName(posix.fd_t)),
             }),
         }) catch |err| {
             std.log.warn("failed to spawn IPC thread for communicating progress to parent: {s}", .{@errorName(err)});
-            return .{ .index = .none };
+            return Node.none;
         };
     } else |env_err| switch (env_err) {
         error.EnvironmentVariableNotFound => {
             if (options.disable_printing) {
-                return .{ .index = .none };
+                return Node.none;
             }
             const stderr = std.io.getStdErr();
             global_progress.terminal = stderr;
-            if (stderr.supportsAnsiEscapeCodes()) {
+            if (stderr.getOrEnableAnsiEscapeSupport()) {
                 global_progress.terminal_mode = .ansi_escape_codes;
             } else if (is_windows and stderr.isTty()) {
                 global_progress.terminal_mode = TerminalMode{ .windows_api = .{
@@ -391,7 +406,7 @@ pub fn start(options: Options) Node {
             }
 
             if (global_progress.terminal_mode == .off) {
-                return .{ .index = .none };
+                return Node.none;
             }
 
             if (have_sigwinch) {
@@ -400,9 +415,7 @@ pub fn start(options: Options) Node {
                     .mask = posix.empty_sigset,
                     .flags = (posix.SA.SIGINFO | posix.SA.RESTART),
                 };
-                posix.sigaction(posix.SIG.WINCH, &act, null) catch |err| {
-                    std.log.warn("failed to install SIGWINCH signal handler for noticing terminal resizes: {s}", .{@errorName(err)});
-                };
+                posix.sigaction(posix.SIG.WINCH, &act, null);
             }
 
             if (switch (global_progress.terminal_mode) {
@@ -413,12 +426,12 @@ pub fn start(options: Options) Node {
                 global_progress.update_thread = thread;
             } else |err| {
                 std.log.warn("unable to spawn thread for printing progress to terminal: {s}", .{@errorName(err)});
-                return .{ .index = .none };
+                return Node.none;
             }
         },
         else => |e| {
             std.log.warn("invalid ZIG_PROGRESS file descriptor integer: {s}", .{@errorName(e)});
-            return .{ .index = .none };
+            return Node.none;
         },
     }
 
@@ -446,10 +459,11 @@ fn updateThreadRun() void {
         if (@atomicLoad(bool, &global_progress.done, .seq_cst)) return;
         maybeUpdateSize(resize_flag);
 
-        const buffer = computeRedraw(&serialized_buffer);
+        const buffer, _ = computeRedraw(&serialized_buffer);
         if (stderr_mutex.tryLock()) {
             defer stderr_mutex.unlock();
             write(buffer) catch return;
+            global_progress.need_clear = true;
         }
     }
 
@@ -464,10 +478,11 @@ fn updateThreadRun() void {
 
         maybeUpdateSize(resize_flag);
 
-        const buffer = computeRedraw(&serialized_buffer);
+        const buffer, _ = computeRedraw(&serialized_buffer);
         if (stderr_mutex.tryLock()) {
             defer stderr_mutex.unlock();
             write(buffer) catch return;
+            global_progress.need_clear = true;
         }
     }
 }
@@ -488,11 +503,13 @@ fn windowsApiUpdateThreadRun() void {
         if (@atomicLoad(bool, &global_progress.done, .seq_cst)) return;
         maybeUpdateSize(resize_flag);
 
-        const buffer = computeRedraw(&serialized_buffer);
+        const buffer, const nl_n = computeRedraw(&serialized_buffer);
         if (stderr_mutex.tryLock()) {
             defer stderr_mutex.unlock();
             windowsApiWriteMarker();
             write(buffer) catch return;
+            global_progress.need_clear = true;
+            windowsApiMoveToMarker(nl_n) catch return;
         }
     }
 
@@ -507,12 +524,14 @@ fn windowsApiUpdateThreadRun() void {
 
         maybeUpdateSize(resize_flag);
 
-        const buffer = computeRedraw(&serialized_buffer);
+        const buffer, const nl_n = computeRedraw(&serialized_buffer);
         if (stderr_mutex.tryLock()) {
             defer stderr_mutex.unlock();
             clearWrittenWindowsApi() catch return;
             windowsApiWriteMarker();
             write(buffer) catch return;
+            global_progress.need_clear = true;
+            windowsApiMoveToMarker(nl_n) catch return;
         }
     }
 }
@@ -520,6 +539,8 @@ fn windowsApiUpdateThreadRun() void {
 /// Allows the caller to freely write to stderr until `unlockStdErr` is called.
 ///
 /// During the lock, any `std.Progress` information is cleared from the terminal.
+///
+/// The lock is recursive; the same thread may hold the lock multiple times.
 pub fn lockStdErr() void {
     stderr_mutex.lock();
     clearWrittenWithEscapeCodes() catch {};
@@ -613,7 +634,7 @@ const TreeSymbol = enum {
 
     fn maxByteLen(symbol: TreeSymbol) usize {
         var max: usize = 0;
-        inline for (@typeInfo(Encoding).Enum.fields) |field| {
+        inline for (@typeInfo(Encoding).@"enum".fields) |field| {
             const len = symbol.bytes(@field(Encoding, field.name)).len;
             max = @max(max, len);
         }
@@ -645,40 +666,10 @@ fn appendTreeSymbol(symbol: TreeSymbol, buf: []u8, start_i: usize) usize {
 }
 
 fn clearWrittenWithEscapeCodes() anyerror!void {
-    if (global_progress.written_newline_count == 0) return;
+    if (!global_progress.need_clear) return;
 
-    var i: usize = 0;
-    const buf = global_progress.draw_buffer;
-
-    buf[i..][0..start_sync.len].* = start_sync.*;
-    i += start_sync.len;
-
-    i = computeClear(buf, i);
-
-    buf[i..][0..finish_sync.len].* = finish_sync.*;
-    i += finish_sync.len;
-
-    global_progress.accumulated_newline_count = 0;
-    try write(buf[0..i]);
-}
-
-fn computeClear(buf: []u8, start_i: usize) usize {
-    var i = start_i;
-
-    const prev_nl_n = global_progress.written_newline_count;
-    if (prev_nl_n > 0) {
-        buf[i] = '\r';
-        i += 1;
-        for (0..prev_nl_n) |_| {
-            buf[i..][0..up_one_line.len].* = up_one_line.*;
-            i += up_one_line.len;
-        }
-    }
-
-    buf[i..][0..clear.len].* = clear.*;
-    i += clear.len;
-
-    return i;
+    global_progress.need_clear = false;
+    try write(clear);
 }
 
 /// U+25BA or ►
@@ -704,38 +695,44 @@ fn clearWrittenWindowsApi() error{Unexpected}!void {
     //   but it must be a valid attribute and it actually needs to apply to the first
     //   character in order to be readable via ReadConsoleOutputAttribute. It doesn't seem
     //   like any of the available attributes are invisible/benign.
-    const prev_nl_n = global_progress.written_newline_count;
-    if (prev_nl_n > 0) {
-        const handle = global_progress.terminal.handle;
-        const screen_area = @as(windows.DWORD, global_progress.cols) * global_progress.rows;
+    if (!global_progress.need_clear) return;
+    const handle = global_progress.terminal.handle;
+    const screen_area = @as(windows.DWORD, global_progress.cols) * global_progress.rows;
 
-        var console_info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (windows.kernel32.GetConsoleScreenBufferInfo(handle, &console_info) == 0) {
-            return error.Unexpected;
-        }
-        const cursor_pos = console_info.dwCursorPosition;
-        const expected_y = cursor_pos.Y - @as(i16, @intCast(prev_nl_n));
-        var start_pos = windows.COORD{ .X = 0, .Y = expected_y };
-        while (start_pos.Y >= 0) {
-            var wchar: [1]u16 = undefined;
-            var num_console_chars_read: windows.DWORD = undefined;
-            if (windows.kernel32.ReadConsoleOutputCharacterW(handle, &wchar, wchar.len, start_pos, &num_console_chars_read) == 0) {
-                return error.Unexpected;
-            }
+    var console_info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (windows.kernel32.GetConsoleScreenBufferInfo(handle, &console_info) == 0) {
+        return error.Unexpected;
+    }
+    var num_chars_written: windows.DWORD = undefined;
+    if (windows.kernel32.FillConsoleOutputCharacterW(handle, ' ', screen_area, console_info.dwCursorPosition, &num_chars_written) == 0) {
+        return error.Unexpected;
+    }
+}
 
-            if (wchar[0] == windows_api_start_marker) break;
-            start_pos.Y -= 1;
-        } else {
-            // If we couldn't find the marker, then just assume that no lines wrapped
-            start_pos = .{ .X = 0, .Y = expected_y };
-        }
-        var num_chars_written: windows.DWORD = undefined;
-        if (windows.kernel32.FillConsoleOutputCharacterW(handle, ' ', screen_area, start_pos, &num_chars_written) == 0) {
+fn windowsApiMoveToMarker(nl_n: usize) error{Unexpected}!void {
+    const handle = global_progress.terminal.handle;
+    var console_info: windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (windows.kernel32.GetConsoleScreenBufferInfo(handle, &console_info) == 0) {
+        return error.Unexpected;
+    }
+    const cursor_pos = console_info.dwCursorPosition;
+    const expected_y = cursor_pos.Y - @as(i16, @intCast(nl_n));
+    var start_pos: windows.COORD = .{ .X = 0, .Y = expected_y };
+    while (start_pos.Y >= 0) {
+        var wchar: [1]u16 = undefined;
+        var num_console_chars_read: windows.DWORD = undefined;
+        if (windows.kernel32.ReadConsoleOutputCharacterW(handle, &wchar, wchar.len, start_pos, &num_console_chars_read) == 0) {
             return error.Unexpected;
         }
-        if (windows.kernel32.SetConsoleCursorPosition(handle, start_pos) == 0) {
-            return error.Unexpected;
-        }
+
+        if (wchar[0] == windows_api_start_marker) break;
+        start_pos.Y -= 1;
+    } else {
+        // If we couldn't find the marker, then just assume that no lines wrapped
+        start_pos = .{ .X = 0, .Y = expected_y };
+    }
+    if (windows.kernel32.SetConsoleCursorPosition(handle, start_pos) == 0) {
+        return error.Unexpected;
     }
 }
 
@@ -751,12 +748,14 @@ const Serialized = struct {
     const Buffer = struct {
         parents: [node_storage_buffer_len]Node.Parent,
         storage: [node_storage_buffer_len]Node.Storage,
-        map: [node_storage_buffer_len]Node.Index,
+        map: [node_storage_buffer_len]Node.OptionalIndex,
 
         parents_copy: [node_storage_buffer_len]Node.Parent,
         storage_copy: [node_storage_buffer_len]Node.Storage,
+        ipc_metadata_fds_copy: [node_storage_buffer_len]Fd,
         ipc_metadata_copy: [node_storage_buffer_len]SavedMetadata,
 
+        ipc_metadata_fds: [node_storage_buffer_len]Fd,
         ipc_metadata: [node_storage_buffer_len]SavedMetadata,
     };
 };
@@ -768,25 +767,34 @@ fn serialize(serialized_buffer: *Serialized.Buffer) Serialized {
     // Iterate all of the nodes and construct a serializable copy of the state that can be examined
     // without atomics.
     const end_index = @atomicLoad(u32, &global_progress.node_end_index, .monotonic);
-    const node_parents = global_progress.node_parents[0..end_index];
-    const node_storage = global_progress.node_storage[0..end_index];
-    for (node_parents, node_storage, 0..) |*parent_ptr, *storage_ptr, i| {
+    for (
+        global_progress.node_parents[0..end_index],
+        global_progress.node_storage[0..end_index],
+        serialized_buffer.map[0..end_index],
+    ) |*parent_ptr, *storage_ptr, *map| {
         var begin_parent = @atomicLoad(Node.Parent, parent_ptr, .acquire);
         while (begin_parent != .unused) {
             const dest_storage = &serialized_buffer.storage[serialized_len];
-            @memcpy(&dest_storage.name, &storage_ptr.name);
+            copyAtomicLoad(&dest_storage.name, &storage_ptr.name);
             dest_storage.estimated_total_count = @atomicLoad(u32, &storage_ptr.estimated_total_count, .acquire);
             dest_storage.completed_count = @atomicLoad(u32, &storage_ptr.completed_count, .monotonic);
             const end_parent = @atomicLoad(Node.Parent, parent_ptr, .acquire);
             if (begin_parent == end_parent) {
                 any_ipc = any_ipc or (dest_storage.getIpcFd() != null);
                 serialized_buffer.parents[serialized_len] = begin_parent;
-                serialized_buffer.map[i] = @enumFromInt(serialized_len);
+                map.* = @enumFromInt(serialized_len);
                 serialized_len += 1;
                 break;
             }
 
             begin_parent = end_parent;
+        } else {
+            // A node may be freed during the execution of this loop, causing
+            // there to be a parent reference to a nonexistent node. Without
+            // this assignment, this would lead to the map entry containing
+            // stale data. By assigning none, the child node with the bad
+            // parent pointer will be harmlessly omitted from the tree.
+            map.* = .none;
         }
     }
 
@@ -810,36 +818,39 @@ fn serialize(serialized_buffer: *Serialized.Buffer) Serialized {
 }
 
 const SavedMetadata = struct {
-    ipc_fd: u16,
+    remaining_read_trash_bytes: u16,
     main_index: u8,
     start_index: u8,
     nodes_len: u8,
+};
 
-    fn getIpcFd(metadata: SavedMetadata) posix.fd_t {
-        return if (is_windows)
-            @ptrFromInt(@as(usize, metadata.ipc_fd) << 2)
-        else
-            metadata.ipc_fd;
+const Fd = enum(i32) {
+    _,
+
+    fn init(fd: posix.fd_t) Fd {
+        return @enumFromInt(if (is_windows) @as(isize, @bitCast(@intFromPtr(fd))) else fd);
     }
 
-    fn setIpcFd(fd: posix.fd_t) u16 {
-        return @intCast(if (is_windows)
-            @shrExact(@intFromPtr(fd), 2)
+    fn get(fd: Fd) posix.fd_t {
+        return if (is_windows)
+            @ptrFromInt(@as(usize, @bitCast(@as(isize, @intFromEnum(fd)))))
         else
-            fd);
+            @intFromEnum(fd);
     }
 };
 
 var ipc_metadata_len: u8 = 0;
-var remaining_read_trash_bytes: usize = 0;
 
 fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buffer) usize {
+    const ipc_metadata_fds_copy = &serialized_buffer.ipc_metadata_fds_copy;
     const ipc_metadata_copy = &serialized_buffer.ipc_metadata_copy;
+    const ipc_metadata_fds = &serialized_buffer.ipc_metadata_fds;
     const ipc_metadata = &serialized_buffer.ipc_metadata;
 
     var serialized_len = start_serialized_len;
-    var pipe_buf: [2 * 4096]u8 align(4) = undefined;
+    var pipe_buf: [2 * 4096]u8 = undefined;
 
+    const old_ipc_metadata_fds = ipc_metadata_fds_copy[0..ipc_metadata_len];
     const old_ipc_metadata = ipc_metadata_copy[0..ipc_metadata_len];
     ipc_metadata_len = 0;
 
@@ -850,6 +861,7 @@ fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buff
     ) |main_parent, *main_storage, main_index| {
         if (main_parent == .unused) continue;
         const fd = main_storage.getIpcFd() orelse continue;
+        const opt_saved_metadata = findOld(fd, old_ipc_metadata_fds, old_ipc_metadata);
         var bytes_read: usize = 0;
         while (true) {
             const n = posix.read(fd, pipe_buf[bytes_read..]) catch |err| switch (err) {
@@ -862,24 +874,26 @@ fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buff
                 },
             };
             if (n == 0) break;
-            if (remaining_read_trash_bytes > 0) {
-                assert(bytes_read == 0);
-                if (remaining_read_trash_bytes >= n) {
-                    remaining_read_trash_bytes -= n;
+            if (opt_saved_metadata) |m| {
+                if (m.remaining_read_trash_bytes > 0) {
+                    assert(bytes_read == 0);
+                    if (m.remaining_read_trash_bytes >= n) {
+                        m.remaining_read_trash_bytes = @intCast(m.remaining_read_trash_bytes - n);
+                        continue;
+                    }
+                    const src = pipe_buf[m.remaining_read_trash_bytes..n];
+                    std.mem.copyForwards(u8, &pipe_buf, src);
+                    m.remaining_read_trash_bytes = 0;
+                    bytes_read = src.len;
                     continue;
                 }
-                const src = pipe_buf[remaining_read_trash_bytes..n];
-                std.mem.copyForwards(u8, &pipe_buf, src);
-                remaining_read_trash_bytes = 0;
-                bytes_read = src.len;
-                continue;
             }
             bytes_read += n;
         }
         // Ignore all but the last message on the pipe.
         var input: []u8 = pipe_buf[0..bytes_read];
         if (input.len == 0) {
-            serialized_len = useSavedIpcData(serialized_len, serialized_buffer, main_storage, main_index, old_ipc_metadata);
+            serialized_len = useSavedIpcData(serialized_len, serialized_buffer, main_storage, main_index, opt_saved_metadata, 0, fd);
             continue;
         }
 
@@ -888,9 +902,8 @@ fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buff
             const expected_bytes = 1 + subtree_len * (@sizeOf(Node.Storage) + @sizeOf(Node.Parent));
             if (input.len < expected_bytes) {
                 // Ignore short reads. We'll handle the next full message when it comes instead.
-                assert(remaining_read_trash_bytes == 0);
-                remaining_read_trash_bytes = expected_bytes - input.len;
-                serialized_len = useSavedIpcData(serialized_len, serialized_buffer, main_storage, main_index, old_ipc_metadata);
+                const remaining_read_trash_bytes: u16 = @intCast(expected_bytes - input.len);
+                serialized_len = useSavedIpcData(serialized_len, serialized_buffer, main_storage, main_index, opt_saved_metadata, remaining_read_trash_bytes, fd);
                 continue :main_loop;
             }
             if (input.len > expected_bytes) {
@@ -908,8 +921,9 @@ fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buff
         const nodes_len: u8 = @intCast(@min(parents.len - 1, serialized_buffer.storage.len - serialized_len));
 
         // Remember in case the pipe is empty on next update.
+        ipc_metadata_fds[ipc_metadata_len] = Fd.init(fd);
         ipc_metadata[ipc_metadata_len] = .{
-            .ipc_fd = SavedMetadata.setIpcFd(fd),
+            .remaining_read_trash_bytes = 0,
             .start_index = @intCast(serialized_len),
             .nodes_len = nodes_len,
             .main_index = @intCast(main_index),
@@ -950,6 +964,7 @@ fn serializeIpc(start_serialized_len: usize, serialized_buffer: *Serialized.Buff
     // Save a copy in case any pipes are empty on the next update.
     @memcpy(serialized_buffer.parents_copy[0..serialized_len], serialized_buffer.parents[0..serialized_len]);
     @memcpy(serialized_buffer.storage_copy[0..serialized_len], serialized_buffer.storage[0..serialized_len]);
+    @memcpy(ipc_metadata_fds_copy[0..ipc_metadata_len], ipc_metadata_fds[0..ipc_metadata_len]);
     @memcpy(ipc_metadata_copy[0..ipc_metadata_len], ipc_metadata[0..ipc_metadata_len]);
 
     return serialized_len;
@@ -963,9 +978,13 @@ fn copyRoot(dest: *Node.Storage, src: *align(1) Node.Storage) void {
     };
 }
 
-fn findOld(ipc_fd: posix.fd_t, old_metadata: []const SavedMetadata) ?*const SavedMetadata {
-    for (old_metadata) |*m| {
-        if (m.getIpcFd() == ipc_fd)
+fn findOld(
+    ipc_fd: posix.fd_t,
+    old_metadata_fds: []Fd,
+    old_metadata: []SavedMetadata,
+) ?*SavedMetadata {
+    for (old_metadata_fds, old_metadata) |fd, *m| {
+        if (fd.get() == ipc_fd)
             return m;
     }
     return null;
@@ -976,16 +995,28 @@ fn useSavedIpcData(
     serialized_buffer: *Serialized.Buffer,
     main_storage: *Node.Storage,
     main_index: usize,
-    old_metadata: []const SavedMetadata,
+    opt_saved_metadata: ?*SavedMetadata,
+    remaining_read_trash_bytes: u16,
+    fd: posix.fd_t,
 ) usize {
     const parents_copy = &serialized_buffer.parents_copy;
     const storage_copy = &serialized_buffer.storage_copy;
+    const ipc_metadata_fds = &serialized_buffer.ipc_metadata_fds;
     const ipc_metadata = &serialized_buffer.ipc_metadata;
 
-    const ipc_fd = main_storage.getIpcFd().?;
-    const saved_metadata = findOld(ipc_fd, old_metadata) orelse {
+    const saved_metadata = opt_saved_metadata orelse {
         main_storage.completed_count = 0;
         main_storage.estimated_total_count = 0;
+        if (remaining_read_trash_bytes > 0) {
+            ipc_metadata_fds[ipc_metadata_len] = Fd.init(fd);
+            ipc_metadata[ipc_metadata_len] = .{
+                .remaining_read_trash_bytes = remaining_read_trash_bytes,
+                .start_index = @intCast(start_serialized_len),
+                .nodes_len = 0,
+                .main_index = @intCast(main_index),
+            };
+            ipc_metadata_len += 1;
+        }
         return start_serialized_len;
     };
 
@@ -993,8 +1024,9 @@ fn useSavedIpcData(
     const nodes_len = @min(saved_metadata.nodes_len, serialized_buffer.storage.len - start_serialized_len);
     const old_main_index = saved_metadata.main_index;
 
+    ipc_metadata_fds[ipc_metadata_len] = Fd.init(fd);
     ipc_metadata[ipc_metadata_len] = .{
-        .ipc_fd = SavedMetadata.setIpcFd(ipc_fd),
+        .remaining_read_trash_bytes = remaining_read_trash_bytes,
         .start_index = @intCast(start_serialized_len),
         .nodes_len = nodes_len,
         .main_index = @intCast(main_index),
@@ -1026,7 +1058,7 @@ fn useSavedIpcData(
     return start_serialized_len + storage.len;
 }
 
-fn computeRedraw(serialized_buffer: *Serialized.Buffer) []u8 {
+fn computeRedraw(serialized_buffer: *Serialized.Buffer) struct { []u8, usize } {
     const serialized = serialize(serialized_buffer);
 
     // Now we can analyze our copy of the graph without atomics, reconstructing
@@ -1052,8 +1084,10 @@ fn computeRedraw(serialized_buffer: *Serialized.Buffer) []u8 {
         }
     }
 
-    // The strategy is: keep the cursor at the end, and then with every redraw:
-    // move cursor to beginning of line, move cursor up N lines, erase to end of screen, write
+    // The strategy is, with every redraw:
+    // erase to end of screen, write, move cursor to beginning of line, move cursor up N lines
+    // This keeps the cursor at the beginning so that unlocked stderr writes
+    // don't get eaten by the clear.
 
     var i: usize = 0;
     const buf = global_progress.draw_buffer;
@@ -1065,25 +1099,37 @@ fn computeRedraw(serialized_buffer: *Serialized.Buffer) []u8 {
 
     switch (global_progress.terminal_mode) {
         .off => unreachable,
-        .ansi_escape_codes => i = computeClear(buf, i),
+        .ansi_escape_codes => {
+            buf[i..][0..clear.len].* = clear.*;
+            i += clear.len;
+        },
         .windows_api => if (!is_windows) unreachable,
     }
 
-    global_progress.accumulated_newline_count = 0;
     const root_node_index: Node.Index = @enumFromInt(0);
-    i = computeNode(buf, i, serialized, children, root_node_index);
+    i, const nl_n = computeNode(buf, i, 0, serialized, children, root_node_index);
 
     if (global_progress.terminal_mode == .ansi_escape_codes) {
+        if (nl_n > 0) {
+            buf[i] = '\r';
+            i += 1;
+            for (0..nl_n) |_| {
+                buf[i..][0..up_one_line.len].* = up_one_line.*;
+                i += up_one_line.len;
+            }
+        }
+
         buf[i..][0..finish_sync.len].* = finish_sync.*;
         i += finish_sync.len;
     }
 
-    return buf[0..i];
+    return .{ buf[0..i], nl_n };
 }
 
 fn computePrefix(
     buf: []u8,
     start_i: usize,
+    nl_n: usize,
     serialized: Serialized,
     children: []const Children,
     node_index: Node.Index,
@@ -1096,36 +1142,45 @@ fn computePrefix(
     {
         return i;
     }
-    i = computePrefix(buf, i, serialized, children, parent_index);
+    i = computePrefix(buf, i, nl_n, serialized, children, parent_index);
     if (children[@intFromEnum(parent_index)].sibling == .none) {
         const prefix = "   ";
-        const upper_bound_len = prefix.len + line_upper_bound_len;
+        const upper_bound_len = prefix.len + lineUpperBoundLen(nl_n);
         if (i + upper_bound_len > buf.len) return buf.len;
         buf[i..][0..prefix.len].* = prefix.*;
         i += prefix.len;
     } else {
-        const upper_bound_len = comptime (TreeSymbol.line.maxByteLen() + line_upper_bound_len);
+        const upper_bound_len = TreeSymbol.line.maxByteLen() + lineUpperBoundLen(nl_n);
         if (i + upper_bound_len > buf.len) return buf.len;
         i = appendTreeSymbol(.line, buf, i);
     }
     return i;
 }
 
-const line_upper_bound_len = @max(TreeSymbol.tee.maxByteLen(), TreeSymbol.langle.maxByteLen()) +
-    "[4294967296/4294967296] ".len + Node.max_name_len + finish_sync.len;
+fn lineUpperBoundLen(nl_n: usize) usize {
+    // \r\n on Windows, \n otherwise.
+    const nl_len = if (is_windows) 2 else 1;
+    return @max(TreeSymbol.tee.maxByteLen(), TreeSymbol.langle.maxByteLen()) +
+        "[4294967296/4294967296] ".len + Node.max_name_len + nl_len +
+        (1 + (nl_n + 1) * up_one_line.len) +
+        finish_sync.len;
+}
 
 fn computeNode(
     buf: []u8,
     start_i: usize,
+    start_nl_n: usize,
     serialized: Serialized,
     children: []const Children,
     node_index: Node.Index,
-) usize {
+) struct { usize, usize } {
     var i = start_i;
-    i = computePrefix(buf, i, serialized, children, node_index);
+    var nl_n = start_nl_n;
 
-    if (i + line_upper_bound_len > buf.len)
-        return start_i;
+    i = computePrefix(buf, i, nl_n, serialized, children, node_index);
+
+    if (i + lineUpperBoundLen(nl_n) > buf.len)
+        return .{ start_i, start_nl_n };
 
     const storage = &serialized.storage[@intFromEnum(node_index)];
     const estimated_total = storage.estimated_total_count;
@@ -1158,36 +1213,42 @@ fn computeNode(
         }
 
         i = @min(global_progress.cols + start_i, i);
+        if (is_windows) {
+            // \r\n on Windows is necessary for the old console with the
+            // ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN
+            // console modes set to behave properly.
+            buf[i] = '\r';
+            i += 1;
+        }
         buf[i] = '\n';
         i += 1;
-        global_progress.accumulated_newline_count += 1;
+        nl_n += 1;
     }
 
-    if (global_progress.withinRowLimit()) {
+    if (global_progress.withinRowLimit(nl_n)) {
         if (children[@intFromEnum(node_index)].child.unwrap()) |child| {
-            i = computeNode(buf, i, serialized, children, child);
+            i, nl_n = computeNode(buf, i, nl_n, serialized, children, child);
         }
     }
 
-    if (global_progress.withinRowLimit()) {
+    if (global_progress.withinRowLimit(nl_n)) {
         if (children[@intFromEnum(node_index)].sibling.unwrap()) |sibling| {
-            i = computeNode(buf, i, serialized, children, sibling);
+            i, nl_n = computeNode(buf, i, nl_n, serialized, children, sibling);
         }
     }
 
-    return i;
+    return .{ i, nl_n };
 }
 
-fn withinRowLimit(p: *Progress) bool {
+fn withinRowLimit(p: *Progress, nl_n: usize) bool {
     // The +2 here is so that the PS1 is not scrolled off the top of the terminal.
     // one because we keep the cursor on the next line
     // one more to account for the PS1
-    return p.accumulated_newline_count + 2 < p.rows;
+    return nl_n + 2 < p.rows;
 }
 
 fn write(buf: []const u8) anyerror!void {
     try global_progress.terminal.writeAll(buf);
-    global_progress.written_newline_count = global_progress.accumulated_newline_count;
 }
 
 var remaining_write_trash_bytes: usize = 0;
@@ -1209,6 +1270,11 @@ fn writeIpc(fd: posix.fd_t, serialized: Serialized) error{BrokenPipe}!void {
         .{ .base = parents.ptr, .len = parents.len },
     };
 
+    // Ensures the packet can fit in the pipe buffer.
+    const upper_bound_msg_len = 1 + node_storage_buffer_len * @sizeOf(Node.Storage) +
+        node_storage_buffer_len * @sizeOf(Node.OptionalIndex);
+    comptime assert(upper_bound_msg_len <= 4096);
+
     while (remaining_write_trash_bytes > 0) {
         // We do this in a separate write call to give a better chance for the
         // writev below to be in a single packet.
@@ -1228,7 +1294,7 @@ fn writeIpc(fd: posix.fd_t, serialized: Serialized) error{BrokenPipe}!void {
 
     // If this write would block we do not want to keep trying, but we need to
     // know if a partial message was written.
-    if (posix.writev(fd, &vecs)) |written| {
+    if (writevNonblock(fd, &vecs)) |written| {
         const total = header.len + storage.len + parents.len;
         if (written < total) {
             remaining_write_trash_bytes = total - written;
@@ -1240,6 +1306,23 @@ fn writeIpc(fd: posix.fd_t, serialized: Serialized) error{BrokenPipe}!void {
             std.log.debug("failed to send progress to parent process: {s}", .{@errorName(e)});
             return error.BrokenPipe;
         },
+    }
+}
+
+fn writevNonblock(fd: posix.fd_t, iov: []posix.iovec_const) posix.WriteError!usize {
+    var iov_index: usize = 0;
+    var written: usize = 0;
+    var total_written: usize = 0;
+    while (true) {
+        while (if (iov_index < iov.len)
+            written >= iov[iov_index].len
+        else
+            return total_written) : (iov_index += 1) written -= iov[iov_index].len;
+        iov[iov_index].base += written;
+        iov[iov_index].len -= written;
+        written = try posix.writev(fd, iov[iov_index..]);
+        if (written == 0) return total_written;
+        total_written += written;
     }
 }
 
@@ -1265,16 +1348,16 @@ fn maybeUpdateSize(resize_flag: bool) void {
         }
     } else {
         var winsize: posix.winsize = .{
-            .ws_row = 0,
-            .ws_col = 0,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
         };
 
         const err = posix.system.ioctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&winsize));
         if (posix.errno(err) == .SUCCESS) {
-            global_progress.rows = winsize.ws_row;
-            global_progress.cols = winsize.ws_col;
+            global_progress.rows = winsize.row;
+            global_progress.cols = winsize.col;
         } else {
             std.log.debug("failed to determine terminal size; using conservative guess 80x25", .{});
             global_progress.rows = 25;
@@ -1283,7 +1366,7 @@ fn maybeUpdateSize(resize_flag: bool) void {
     }
 }
 
-fn handleSigWinch(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.C) void {
+fn handleSigWinch(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
     _ = info;
     _ = ctx_ptr;
     assert(sig == posix.SIG.WINCH);
@@ -1309,4 +1392,33 @@ const have_sigwinch = switch (builtin.os.tag) {
     else => false,
 };
 
-var stderr_mutex: std.Thread.Mutex = .{};
+/// The primary motivation for recursive mutex here is so that a panic while
+/// stderr mutex is held still dumps the stack trace and other debug
+/// information.
+var stderr_mutex = std.Thread.Mutex.Recursive.init;
+
+fn copyAtomicStore(dest: []align(@alignOf(usize)) u8, src: []const u8) void {
+    assert(dest.len == src.len);
+    const chunked_len = dest.len / @sizeOf(usize);
+    const dest_chunked: []usize = @as([*]usize, @ptrCast(dest))[0..chunked_len];
+    const src_chunked: []align(1) const usize = @as([*]align(1) const usize, @ptrCast(src))[0..chunked_len];
+    for (dest_chunked, src_chunked) |*d, s| {
+        @atomicStore(usize, d, s, .monotonic);
+    }
+    const remainder_start = chunked_len * @sizeOf(usize);
+    for (dest[remainder_start..], src[remainder_start..]) |*d, s| {
+        @atomicStore(u8, d, s, .monotonic);
+    }
+}
+
+fn copyAtomicLoad(
+    dest: *align(@alignOf(usize)) [Node.max_name_len]u8,
+    src: *align(@alignOf(usize)) const [Node.max_name_len]u8,
+) void {
+    const chunked_len = @divExact(dest.len, @sizeOf(usize));
+    const dest_chunked: *[chunked_len]usize = @ptrCast(dest);
+    const src_chunked: *const [chunked_len]usize = @ptrCast(src);
+    for (dest_chunked, src_chunked) |*d, *s| {
+        d.* = @atomicLoad(usize, s, .monotonic);
+    }
+}

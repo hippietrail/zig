@@ -4,7 +4,6 @@ const expect = std.testing.expect;
 
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const DW = std.dwarf;
 
 /// EFLAGS condition codes
 pub const Condition = enum(u5) {
@@ -151,9 +150,34 @@ pub const Condition = enum(u5) {
             .nz_or_p => .z_and_np,
         };
     }
+
+    /// Returns the equivalent condition when the operands are swapped.
+    pub fn commute(cond: Condition) Condition {
+        return switch (cond) {
+            else => cond,
+            .a => .b,
+            .ae => .be,
+            .b => .a,
+            .be => .ae,
+            .c => .a,
+            .g => .l,
+            .ge => .le,
+            .l => .g,
+            .le => .ge,
+            .na => .nb,
+            .nae => .nbe,
+            .nb => .na,
+            .nbe => .nae,
+            .nc => .na,
+            .ng => .nl,
+            .nge => .nle,
+            .nl => .ng,
+            .nle => .nge,
+        };
+    }
 };
 
-pub const Register = enum(u7) {
+pub const Register = enum(u8) {
     // zig fmt: off
     rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
     r8, r9, r10, r11, r12, r13, r14, r15,
@@ -183,6 +207,12 @@ pub const Register = enum(u7) {
 
     rip, eip, ip,
 
+    cr0, cr1, cr2,  cr3,  cr4,  cr5,  cr6,  cr7,
+    cr8, cr9, cr10, cr11, cr12, cr13, cr14, cr15,
+
+    dr0, dr1, dr2,  dr3,  dr4,  dr5,  dr6,  dr7,
+    dr8, dr9, dr10, dr11, dr12, dr13, dr14, dr15,
+
     none,
     // zig fmt: on
 
@@ -192,6 +222,9 @@ pub const Register = enum(u7) {
         x87,
         mmx,
         sse,
+        ip,
+        cr,
+        dr,
     };
 
     pub fn class(reg: Register) Class {
@@ -209,13 +242,16 @@ pub const Register = enum(u7) {
             @intFromEnum(Register.st0)  ... @intFromEnum(Register.st7)   => .x87,
 
             @intFromEnum(Register.es)   ... @intFromEnum(Register.gs)    => .segment,
+            @intFromEnum(Register.rip)  ... @intFromEnum(Register.ip)    => .ip,
+            @intFromEnum(Register.cr0)  ... @intFromEnum(Register.cr15)  => .cr,
+            @intFromEnum(Register.dr0)  ... @intFromEnum(Register.dr15)  => .dr,
 
             else => unreachable,
             // zig fmt: on
         };
     }
 
-    pub fn id(reg: Register) u6 {
+    pub fn id(reg: Register) u7 {
         const base = switch (@intFromEnum(reg)) {
             // zig fmt: off
             @intFromEnum(Register.rax)  ... @intFromEnum(Register.r15)   => @intFromEnum(Register.rax),
@@ -228,8 +264,9 @@ pub const Register = enum(u7) {
             @intFromEnum(Register.xmm0) ... @intFromEnum(Register.xmm15) => @intFromEnum(Register.xmm0) - 16,
             @intFromEnum(Register.mm0)  ... @intFromEnum(Register.mm7)   => @intFromEnum(Register.mm0) - 32,
             @intFromEnum(Register.st0)  ... @intFromEnum(Register.st7)   => @intFromEnum(Register.st0) - 40,
-
             @intFromEnum(Register.es)   ... @intFromEnum(Register.gs)    => @intFromEnum(Register.es) - 48,
+            @intFromEnum(Register.cr0)  ... @intFromEnum(Register.cr15)  => @intFromEnum(Register.cr0) - 54,
+            @intFromEnum(Register.dr0)  ... @intFromEnum(Register.dr15)  => @intFromEnum(Register.dr0) - 70,
 
             else => unreachable,
             // zig fmt: on
@@ -253,6 +290,9 @@ pub const Register = enum(u7) {
 
             @intFromEnum(Register.es)   ... @intFromEnum(Register.gs)    => 16,
 
+            @intFromEnum(Register.cr0)  ... @intFromEnum(Register.cr15)  => 64,
+            @intFromEnum(Register.dr0)  ... @intFromEnum(Register.dr15)  => 64,
+
             else => unreachable,
             // zig fmt: on
         };
@@ -268,6 +308,9 @@ pub const Register = enum(u7) {
 
             @intFromEnum(Register.ymm8) ... @intFromEnum(Register.ymm15) => true,
             @intFromEnum(Register.xmm8) ... @intFromEnum(Register.xmm15) => true,
+
+            @intFromEnum(Register.cr8)  ... @intFromEnum(Register.cr15)  => true,
+            @intFromEnum(Register.dr8)  ... @intFromEnum(Register.dr15)  => true,
 
             else => false,
             // zig fmt: on
@@ -289,6 +332,9 @@ pub const Register = enum(u7) {
             @intFromEnum(Register.st0)  ... @intFromEnum(Register.st7)   => @intFromEnum(Register.st0),
 
             @intFromEnum(Register.es)   ... @intFromEnum(Register.gs)    => @intFromEnum(Register.es),
+
+            @intFromEnum(Register.cr0)  ... @intFromEnum(Register.cr15)  => @intFromEnum(Register.cr0),
+            @intFromEnum(Register.dr0)  ... @intFromEnum(Register.dr15)  => @intFromEnum(Register.dr0),
 
             else => unreachable,
             // zig fmt: on
@@ -370,13 +416,15 @@ pub const Register = enum(u7) {
             .x87 => 33 + @as(u6, reg.enc()),
             .mmx => 41 + @as(u6, reg.enc()),
             .segment => 50 + @as(u6, reg.enc()),
+            .ip => 16,
+            .cr, .dr => unreachable,
         };
     }
 };
 
 test "Register id - different classes" {
     try expect(Register.al.id() == Register.ax.id());
-    try expect(Register.ah.id() == Register.spl.id());
+    try expect(Register.ah.id() != Register.spl.id());
     try expect(Register.ax.id() == Register.eax.id());
     try expect(Register.eax.id() == Register.rax.id());
 
@@ -391,6 +439,7 @@ test "Register id - different classes" {
 
 test "Register enc - different classes" {
     try expect(Register.al.enc() == Register.ax.enc());
+    try expect(Register.ah.enc() == Register.spl.enc());
     try expect(Register.ax.enc() == Register.eax.enc());
     try expect(Register.eax.enc() == Register.rax.enc());
     try expect(Register.ymm0.enc() == Register.rax.enc());
@@ -420,7 +469,7 @@ pub const FrameIndex = enum(u32) {
     // Other indices are used for local variable stack slots
     _,
 
-    pub const named_count = @typeInfo(FrameIndex).Enum.fields.len;
+    pub const named_count = @typeInfo(FrameIndex).@"enum".fields.len;
 
     pub fn isNamed(fi: FrameIndex) bool {
         return @intFromEnum(fi) < named_count;
@@ -444,59 +493,48 @@ pub const FrameIndex = enum(u32) {
     }
 };
 
-/// A linker symbol not yet allocated in VM.
-pub const Symbol = struct {
-    /// Index of the containing atom.
-    atom_index: u32,
-    /// Index into the linker's symbol table.
-    sym_index: u32,
+pub const FrameAddr = struct { index: FrameIndex, off: i32 = 0 };
 
-    pub fn format(
-        sym: Symbol,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) @TypeOf(writer).Error!void {
-        try writer.writeAll("Symbol(");
-        try std.fmt.formatType(sym.atom_index, fmt, options, writer, 0);
-        try writer.writeAll(", ");
-        try std.fmt.formatType(sym.sym_index, fmt, options, writer, 0);
-        try writer.writeByte(')');
-    }
-};
+pub const RegisterOffset = struct { reg: Register, off: i32 = 0 };
+
+pub const SymbolOffset = struct { sym_index: u32, off: i32 = 0 };
 
 pub const Memory = struct {
-    base: Base,
-    mod: Mod,
+    base: Base = .none,
+    mod: Mod = .{ .rm = .{} },
 
-    pub const Base = union(enum(u2)) {
+    pub const Base = union(enum(u3)) {
         none,
         reg: Register,
         frame: FrameIndex,
-        reloc: Symbol,
+        table,
+        reloc: u32,
 
-        pub const Tag = @typeInfo(Base).Union.tag_type.?;
+        pub const Tag = @typeInfo(Base).@"union".tag_type.?;
 
         pub fn isExtended(self: Base) bool {
             return switch (self) {
-                .none, .frame, .reloc => false, // rsp, rbp, and rip are not extended
+                .none, .frame, .table, .reloc => false, // rsp, rbp, and rip are not extended
                 .reg => |reg| reg.isExtended(),
             };
         }
     };
 
     pub const Mod = union(enum(u1)) {
-        rm: struct {
-            size: Size,
+        rm: Rm,
+        off: u64,
+
+        pub const Rm = struct {
+            size: Size = .none,
             index: Register = .none,
             scale: Scale = .@"1",
             disp: i32 = 0,
-        },
-        off: u64,
+        };
     };
 
     pub const Size = enum(u4) {
         none,
+        ptr,
         byte,
         word,
         dword,
@@ -533,9 +571,10 @@ pub const Memory = struct {
             };
         }
 
-        pub fn bitSize(s: Size) u64 {
+        pub fn bitSize(s: Size, target: *const std.Target) u64 {
             return switch (s) {
                 .none => 0,
+                .ptr => target.ptrBitWidth(),
                 .byte => 8,
                 .word => 16,
                 .dword => 32,
@@ -555,16 +594,56 @@ pub const Memory = struct {
         ) @TypeOf(writer).Error!void {
             if (s == .none) return;
             try writer.writeAll(@tagName(s));
-            try writer.writeAll(" ptr");
+            switch (s) {
+                .none => unreachable,
+                .ptr => {},
+                else => {
+                    try writer.writeByte(' ');
+                    try writer.writeAll("ptr");
+                },
+            }
         }
     };
 
-    pub const Scale = enum(u2) { @"1", @"2", @"4", @"8" };
+    pub const Scale = enum(u2) {
+        @"1",
+        @"2",
+        @"4",
+        @"8",
+
+        pub fn fromFactor(factor: u4) Scale {
+            return switch (factor) {
+                else => unreachable,
+                1 => .@"1",
+                2 => .@"2",
+                4 => .@"4",
+                8 => .@"8",
+            };
+        }
+
+        pub fn toFactor(scale: Scale) u4 {
+            return switch (scale) {
+                .@"1" => 1,
+                .@"2" => 2,
+                .@"4" => 4,
+                .@"8" => 8,
+            };
+        }
+
+        pub fn fromLog2(log2: u2) Scale {
+            return @enumFromInt(log2);
+        }
+
+        pub fn toLog2(scale: Scale) u2 {
+            return @intFromEnum(scale);
+        }
+    };
 };
 
 pub const Immediate = union(enum) {
     signed: i32,
     unsigned: u64,
+    reloc: SymbolOffset,
 
     pub fn u(x: u64) Immediate {
         return .{ .unsigned = x };
@@ -574,39 +653,19 @@ pub const Immediate = union(enum) {
         return .{ .signed = x };
     }
 
-    pub fn asSigned(imm: Immediate, bit_size: u64) i64 {
-        return switch (imm) {
-            .signed => |x| switch (bit_size) {
-                1, 8 => @as(i8, @intCast(x)),
-                16 => @as(i16, @intCast(x)),
-                32, 64 => x,
-                else => unreachable,
-            },
-            .unsigned => |x| switch (bit_size) {
-                1, 8 => @as(i8, @bitCast(@as(u8, @intCast(x)))),
-                16 => @as(i16, @bitCast(@as(u16, @intCast(x)))),
-                32 => @as(i32, @bitCast(@as(u32, @intCast(x)))),
-                64 => @bitCast(x),
-                else => unreachable,
-            },
-        };
+    pub fn rel(sym_off: SymbolOffset) Immediate {
+        return .{ .reloc = sym_off };
     }
 
-    pub fn asUnsigned(imm: Immediate, bit_size: u64) u64 {
-        return switch (imm) {
-            .signed => |x| switch (bit_size) {
-                1, 8 => @as(u8, @bitCast(@as(i8, @intCast(x)))),
-                16 => @as(u16, @bitCast(@as(i16, @intCast(x)))),
-                32, 64 => @as(u32, @bitCast(x)),
-                else => unreachable,
-            },
-            .unsigned => |x| switch (bit_size) {
-                1, 8 => @as(u8, @intCast(x)),
-                16 => @as(u16, @intCast(x)),
-                32 => @as(u32, @intCast(x)),
-                64 => x,
-                else => unreachable,
-            },
-        };
+    pub fn format(
+        imm: Immediate,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        switch (imm) {
+            inline else => |int| try writer.print("{d}", .{int}),
+            .reloc => |sym_off| try writer.print("Symbol({[sym_index]d}) + {[off]d}", sym_off),
+        }
     }
 };

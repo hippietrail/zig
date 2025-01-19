@@ -14,8 +14,6 @@ fn add(args: anytype) i32 {
 }
 
 test "add arbitrary args" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
     try expect(add(.{ @as(i32, 1), @as(i32, 2), @as(i32, 3), @as(i32, 4) }) == 10);
     try expect(add(.{@as(i32, 1234)}) == 1234);
     try expect(add(.{}) == 0);
@@ -26,15 +24,12 @@ fn readFirstVarArg(args: anytype) void {
 }
 
 test "send void arg to var args" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
     readFirstVarArg(.{{}});
 }
 
 test "pass args directly" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     try expect(addSomeStuff(.{ @as(i32, 1), @as(i32, 2), @as(i32, 3), @as(i32, 4) }) == 10);
     try expect(addSomeStuff(.{@as(i32, 1234)}) == 1234);
@@ -48,7 +43,6 @@ fn addSomeStuff(args: anytype) i32 {
 test "runtime parameter before var args" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     try expect((try extraFn(10, .{})) == 0);
     try expect((try extraFn(10, .{false})) == 1);
@@ -87,15 +81,11 @@ fn foo2(args: anytype) bool {
 }
 
 test "array of var args functions" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
     try expect(foos[0](.{}));
     try expect(!foos[1](.{}));
 }
 
 test "pass zero length array to var args param" {
-    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
     doNothingWithFirstArg(.{""});
 }
 
@@ -110,26 +100,27 @@ test "simple variadic function" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.os.tag != .macos and comptime builtin.cpu.arch.isAARCH64()) {
+    if (builtin.os.tag != .macos and builtin.cpu.arch.isAARCH64()) {
         // https://github.com/ziglang/zig/issues/14096
         return error.SkipZigTest;
     }
     if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows) return error.SkipZigTest; // TODO
+    if (builtin.cpu.arch == .s390x and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21350
 
     const S = struct {
-        fn simple(...) callconv(.C) c_int {
+        fn simple(...) callconv(.c) c_int {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             return @cVaArg(&ap, c_int);
         }
 
-        fn compatible(_: c_int, ...) callconv(.C) c_int {
+        fn compatible(_: c_int, ...) callconv(.c) c_int {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             return @cVaArg(&ap, c_int);
         }
 
-        fn add(count: c_int, ...) callconv(.C) c_int {
+        fn add(count: c_int, ...) callconv(.c) c_int {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             var i: usize = 0;
@@ -170,14 +161,15 @@ test "coerce reference to var arg" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.os.tag != .macos and comptime builtin.cpu.arch.isAARCH64()) {
+    if (builtin.os.tag != .macos and builtin.cpu.arch.isAARCH64()) {
         // https://github.com/ziglang/zig/issues/14096
         return error.SkipZigTest;
     }
     if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows) return error.SkipZigTest; // TODO
+    if (builtin.cpu.arch == .s390x and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21350
 
     const S = struct {
-        fn addPtr(count: c_int, ...) callconv(.C) c_int {
+        fn addPtr(count: c_int, ...) callconv(.c) c_int {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             var i: usize = 0;
@@ -202,14 +194,15 @@ test "variadic functions" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.os.tag != .macos and comptime builtin.cpu.arch.isAARCH64()) {
+    if (builtin.os.tag != .macos and builtin.cpu.arch.isAARCH64()) {
         // https://github.com/ziglang/zig/issues/14096
         return error.SkipZigTest;
     }
     if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows) return error.SkipZigTest; // TODO
+    if (builtin.cpu.arch == .s390x and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21350
 
     const S = struct {
-        fn printf(list_ptr: *std.ArrayList(u8), format: [*:0]const u8, ...) callconv(.C) void {
+        fn printf(list_ptr: *std.ArrayList(u8), format: [*:0]const u8, ...) callconv(.c) void {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             vprintf(list_ptr, format, &ap);
@@ -219,7 +212,7 @@ test "variadic functions" {
             list: *std.ArrayList(u8),
             format: [*:0]const u8,
             ap: *std.builtin.VaList,
-        ) callconv(.C) void {
+        ) callconv(.c) void {
             for (std.mem.span(format)) |c| switch (c) {
                 's' => {
                     const arg = @cVaArg(ap, [*:0]const u8);
@@ -246,14 +239,15 @@ test "copy VaList" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.os.tag != .macos and comptime builtin.cpu.arch.isAARCH64()) {
+    if (builtin.os.tag != .macos and builtin.cpu.arch.isAARCH64()) {
         // https://github.com/ziglang/zig/issues/14096
         return error.SkipZigTest;
     }
     if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows) return error.SkipZigTest; // TODO
+    if (builtin.cpu.arch == .s390x and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21350
 
     const S = struct {
-        fn add(count: c_int, ...) callconv(.C) c_int {
+        fn add(count: c_int, ...) callconv(.c) c_int {
             var ap = @cVaStart();
             defer @cVaEnd(&ap);
             var copy = @cVaCopy(&ap);
@@ -279,7 +273,7 @@ test "unused VaList arg" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.os.tag != .macos and comptime builtin.cpu.arch.isAARCH64()) {
+    if (builtin.os.tag != .macos and builtin.cpu.arch.isAARCH64()) {
         // https://github.com/ziglang/zig/issues/14096
         return error.SkipZigTest;
     }
@@ -287,9 +281,10 @@ test "unused VaList arg" {
         // https://github.com/ziglang/zig/issues/16961
         return error.SkipZigTest; // TODO
     }
+    if (builtin.cpu.arch == .s390x and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21350
 
     const S = struct {
-        fn thirdArg(dummy: c_int, ...) callconv(.C) c_int {
+        fn thirdArg(dummy: c_int, ...) callconv(.c) c_int {
             _ = dummy;
 
             var ap = @cVaStart();

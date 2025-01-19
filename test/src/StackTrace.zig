@@ -44,24 +44,27 @@ fn addExpect(
     for (mode_config.exclude_os) |tag| if (tag == builtin.os.tag) return;
 
     const b = self.b;
-    const annotated_case_name = fmt.allocPrint(b.allocator, "check {s} ({s})", .{
+    const annotated_case_name = b.fmt("check {s} ({s})", .{
         name, @tagName(optimize_mode),
-    }) catch @panic("OOM");
+    });
     for (self.test_filters) |test_filter| {
         if (mem.indexOf(u8, annotated_case_name, test_filter)) |_| break;
     } else if (self.test_filters.len > 0) return;
 
-    const write_src = b.addWriteFile("source.zig", source);
+    const write_files = b.addWriteFiles();
+    const source_zig = write_files.add("source.zig", source);
     const exe = b.addExecutable(.{
         .name = "test",
-        .root_source_file = write_src.files.items[0].getPath(),
-        .optimize = optimize_mode,
-        .target = b.host,
-        .error_tracing = mode_config.error_tracing,
+        .root_module = b.createModule(.{
+            .root_source_file = source_zig,
+            .optimize = optimize_mode,
+            .target = b.graph.host,
+            .error_tracing = mode_config.error_tracing,
+        }),
     });
 
     const run = b.addRunArtifact(exe);
-    run.removeEnvironmentVariable("YES_COLOR");
+    run.removeEnvironmentVariable("CLICOLOR_FORCE");
     run.setEnvironmentVariable("NO_COLOR", "1");
     run.expectExitCode(1);
     run.expectStdOutEqual("");
@@ -82,5 +85,4 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Step = std.Build.Step;
 const OptimizeMode = std.builtin.OptimizeMode;
-const fmt = std.fmt;
 const mem = std.mem;

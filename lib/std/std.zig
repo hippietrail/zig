@@ -25,12 +25,7 @@ pub const EnumMap = enums.EnumMap;
 pub const EnumSet = enums.EnumSet;
 pub const HashMap = hash_map.HashMap;
 pub const HashMapUnmanaged = hash_map.HashMapUnmanaged;
-pub const Ini = @import("Ini.zig");
 pub const MultiArrayList = @import("multi_array_list.zig").MultiArrayList;
-pub const PackedIntArray = @import("packed_int_array.zig").PackedIntArray;
-pub const PackedIntArrayEndian = @import("packed_int_array.zig").PackedIntArrayEndian;
-pub const PackedIntSlice = @import("packed_int_array.zig").PackedIntSlice;
-pub const PackedIntSliceEndian = @import("packed_int_array.zig").PackedIntSliceEndian;
 pub const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 pub const PriorityDequeue = @import("priority_dequeue.zig").PriorityDequeue;
 pub const Progress = @import("Progress.zig");
@@ -44,8 +39,6 @@ pub const StringHashMap = hash_map.StringHashMap;
 pub const StringHashMapUnmanaged = hash_map.StringHashMapUnmanaged;
 pub const StringArrayHashMap = array_hash_map.StringArrayHashMap;
 pub const StringArrayHashMapUnmanaged = array_hash_map.StringArrayHashMapUnmanaged;
-/// deprecated: use `DoublyLinkedList`.
-pub const TailQueue = DoublyLinkedList;
 pub const Target = @import("Target.zig");
 pub const Thread = @import("Thread.zig");
 pub const Treap = @import("treap.zig").Treap;
@@ -85,12 +78,9 @@ pub const meta = @import("meta.zig");
 pub const net = @import("net.zig");
 pub const os = @import("os.zig");
 pub const once = @import("once.zig").once;
-pub const packed_int_array = @import("packed_int_array.zig");
 pub const pdb = @import("pdb.zig");
 pub const posix = @import("posix.zig");
 pub const process = @import("process.zig");
-/// Deprecated: use `Random` instead.
-pub const rand = Random;
 pub const sort = @import("sort.zig");
 pub const simd = @import("simd.zig");
 pub const ascii = @import("ascii.zig");
@@ -155,6 +145,11 @@ pub const Options = struct {
     /// This will likely reduce the size of the binary, but it will also make it impossible to
     /// make a HTTPS connection.
     http_disable_tls: bool = false,
+
+    /// This enables `std.http.Client` to log ssl secrets to the file specified by the SSLKEYLOGFILE
+    /// env var.  Creating such a log file allows other programs with access to that file to decrypt
+    /// all `std.http.Client` traffic made by this program.
+    http_enable_ssl_key_log_file: bool = @import("builtin").mode == .Debug,
 
     side_channels_mitigations: crypto.SideChannelsMitigations = crypto.default_side_channels_mitigations,
 };
