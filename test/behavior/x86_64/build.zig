@@ -1,6 +1,13 @@
 const std = @import("std");
 pub fn build(b: *std.Build) void {
-    const compiler_rt_lib = b.addStaticLibrary(.{
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Skip tests that do not match any filter",
+    ) orelse &[0][]const u8{};
+
+    const compiler_rt_lib = b.addLibrary(.{
+        .linkage = .static,
         .name = "compiler_rt",
         .use_llvm = false,
         .use_lld = false,
@@ -25,7 +32,14 @@ pub fn build(b: *std.Build) void {
             .cpu_features_sub = std.Target.x86.featureSet(&.{
                 .cmov,
                 //.sse,
+                .sse2,
             }),
+        },
+        .{
+            .cpu_arch = .x86_64,
+            .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64 },
+            .cpu_features_add = std.Target.x86.featureSet(&.{.sahf}),
+            .cpu_features_sub = std.Target.x86.featureSet(&.{.cmov}),
         },
         //.{
         //    .cpu_arch = .x86_64,
@@ -96,6 +110,7 @@ pub fn build(b: *std.Build) void {
             });
             const test_exe = b.addTest(.{
                 .name = std.fs.path.stem(path),
+                .filters = test_filters,
                 .use_llvm = false,
                 .use_lld = false,
                 .root_module = test_mod,

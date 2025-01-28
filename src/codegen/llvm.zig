@@ -1497,8 +1497,7 @@ pub const Object = struct {
             .unsigned => try attributes.addRetAttr(.zeroext, &o.builder),
         };
 
-        const err_return_tracing = Type.fromInterned(fn_info.return_type).isError(zcu) and
-            comp.config.any_error_tracing;
+        const err_return_tracing = fn_info.cc == .auto and comp.config.any_error_tracing;
 
         const err_ret_trace: Builder.Value = if (err_return_tracing) param: {
             const param = wip.arg(llvm_arg_i);
@@ -2805,9 +2804,7 @@ pub const Object = struct {
                     debug_param_types.appendAssumeCapacity(try o.lowerDebugType(Type.void));
                 }
 
-                if (Type.fromInterned(fn_info.return_type).isError(zcu) and
-                    zcu.comp.config.any_error_tracing)
-                {
+                if (fn_info.cc == .auto and zcu.comp.config.any_error_tracing) {
                     const ptr_ty = try pt.singleMutPtrType(try o.getStackTraceType());
                     debug_param_types.appendAssumeCapacity(try o.lowerDebugType(ptr_ty));
                 }
@@ -2970,8 +2967,7 @@ pub const Object = struct {
             llvm_arg_i += 1;
         }
 
-        const err_return_tracing = Type.fromInterned(fn_info.return_type).isError(zcu) and
-            zcu.comp.config.any_error_tracing;
+        const err_return_tracing = fn_info.cc == .auto and zcu.comp.config.any_error_tracing;
 
         if (err_return_tracing) {
             try attributes.addParamAttr(llvm_arg_i, .nonnull, &o.builder);
@@ -3372,7 +3368,6 @@ pub const Object = struct {
             .bool_true,
             .bool_false,
             .empty_tuple,
-            .generic_poison,
             .none,
             => unreachable,
             else => switch (ip.indexToKey(t.toIntern())) {
@@ -3737,9 +3732,7 @@ pub const Object = struct {
             try llvm_params.append(o.gpa, .ptr);
         }
 
-        if (Type.fromInterned(fn_info.return_type).isError(zcu) and
-            zcu.comp.config.any_error_tracing)
-        {
+        if (fn_info.cc == .auto and zcu.comp.config.any_error_tracing) {
             const ptr_ty = try pt.singleMutPtrType(try o.getStackTraceType());
             try llvm_params.append(o.gpa, try o.lowerType(ptr_ty));
         }
@@ -3923,7 +3916,6 @@ pub const Object = struct {
                 .null => unreachable, // non-runtime value
                 .empty_tuple => unreachable, // non-runtime value
                 .@"unreachable" => unreachable, // non-runtime value
-                .generic_poison => unreachable, // non-runtime value
 
                 .false => .false,
                 .true => .true,
@@ -5027,18 +5019,6 @@ pub const FuncGen = struct {
         );
     }
 
-    fn resolveNullOptUsize(self: *FuncGen) Error!Builder.Constant {
-        const o = self.ng.object;
-        const pt = o.pt;
-        if (o.null_opt_usize == .no_init) {
-            o.null_opt_usize = try self.resolveValue(Value.fromInterned(try pt.intern(.{ .opt = .{
-                .ty = try pt.intern(.{ .opt_type = .usize_type }),
-                .val = .none,
-            } })));
-        }
-        return o.null_opt_usize;
-    }
-
     fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.CoveragePoint) Error!void {
         const o = self.ng.object;
         const zcu = o.pt.zcu;
@@ -5485,7 +5465,7 @@ pub const FuncGen = struct {
             break :blk ret_ptr;
         };
 
-        const err_return_tracing = return_type.isError(zcu) and zcu.comp.config.any_error_tracing;
+        const err_return_tracing = fn_info.cc == .auto and zcu.comp.config.any_error_tracing;
         if (err_return_tracing) {
             assert(self.err_ret_trace != .none);
             try llvm_args.append(self.err_ret_trace);
@@ -5740,30 +5720,16 @@ pub const FuncGen = struct {
         }
     }
 
-    fn buildSimplePanic(fg: *FuncGen, panic_id: Zcu.PanicId) !void {
+    fn buildSimplePanic(fg: *FuncGen, panic_id: Zcu.SimplePanicId) !void {
         const o = fg.ng.object;
         const zcu = o.pt.zcu;
-        const ip = &zcu.intern_pool;
-        const msg_len: u64, const msg_ptr: Builder.Constant = msg: {
-            const str_val = zcu.builtin_decl_values.get(panic_id.toBuiltin());
-            assert(str_val != .none);
-            const slice = ip.indexToKey(str_val).slice;
-            break :msg .{ Value.fromInterned(slice.len).toUnsignedInt(zcu), try o.lowerValue(slice.ptr) };
-        };
-        const null_opt_addr_global = try fg.resolveNullOptUsize();
         const target = zcu.getTarget();
-        const llvm_usize = try o.lowerType(Type.usize);
-        // example:
-        // call fastcc void @test2.panic(
-        //   ptr @builtin.panic_messages.integer_overflow__anon_987, ; msg.ptr
-        //   i64 16,                                                 ; msg.len
-        //   ptr null,                                               ; stack trace
-        //   ptr @2,                                                 ; addr (null ?usize)
-        // )
-        const panic_func = zcu.funcInfo(zcu.builtin_decl_values.get(.@"Panic.call"));
-        const panic_nav = ip.getNav(panic_func.owner_nav);
-        const fn_info = zcu.typeToFunc(Type.fromInterned(panic_nav.typeOf(ip))).?;
+        const panic_func = zcu.funcInfo(zcu.builtin_decl_values.get(panic_id.toBuiltin()));
+        const fn_info = zcu.typeToFunc(.fromInterned(panic_func.ty)).?;
         const panic_global = try o.resolveLlvmFunction(panic_func.owner_nav);
+
+        const has_err_trace = zcu.comp.config.any_error_tracing and fn_info.cc == .auto;
+        if (has_err_trace) assert(fg.err_ret_trace != .none);
         _ = try fg.wip.callIntrinsicAssumeCold();
         _ = try fg.wip.call(
             .normal,
@@ -5771,12 +5737,7 @@ pub const FuncGen = struct {
             .none,
             panic_global.typeOf(&o.builder),
             panic_global.toValue(&o.builder),
-            &.{
-                msg_ptr.toValue(),
-                try o.builder.intValue(llvm_usize, msg_len),
-                try o.builder.nullValue(.ptr),
-                null_opt_addr_global.toValue(),
-            },
+            if (has_err_trace) &.{fg.err_ret_trace} else &.{},
             "",
         );
         _ = try fg.wip.@"unreachable"();
@@ -8571,19 +8532,37 @@ pub const FuncGen = struct {
         }
         if (scalar_ty.isSignedInt(zcu)) {
             const inst_llvm_ty = try o.lowerType(inst_ty);
-            const bit_size_minus_one = try o.builder.splatValue(inst_llvm_ty, try o.builder.intConst(
+
+            const ExpectedContents = [std.math.big.int.calcTwosCompLimbCount(256)]std.math.big.Limb;
+            var stack align(@max(
+                @alignOf(std.heap.StackFallbackAllocator(0)),
+                @alignOf(ExpectedContents),
+            )) = std.heap.stackFallback(@sizeOf(ExpectedContents), self.gpa);
+            const allocator = stack.get();
+
+            const scalar_bits = inst_llvm_ty.scalarBits(&o.builder);
+            var smin_big_int: std.math.big.int.Mutable = .{
+                .limbs = try allocator.alloc(
+                    std.math.big.Limb,
+                    std.math.big.int.calcTwosCompLimbCount(scalar_bits),
+                ),
+                .len = undefined,
+                .positive = undefined,
+            };
+            defer allocator.free(smin_big_int.limbs);
+            smin_big_int.setTwosCompIntLimit(.min, .signed, scalar_bits);
+            const smin = try o.builder.splatValue(inst_llvm_ty, try o.builder.bigIntConst(
                 inst_llvm_ty.scalarType(&o.builder),
-                inst_llvm_ty.scalarBits(&o.builder) - 1,
+                smin_big_int.toConst(),
             ));
 
-            const div = try self.wip.bin(.sdiv, lhs, rhs, "");
-            const rem = try self.wip.bin(.srem, lhs, rhs, "");
-            const div_sign = try self.wip.bin(.xor, lhs, rhs, "");
-            const div_sign_mask = try self.wip.bin(.ashr, div_sign, bit_size_minus_one, "");
-            const zero = try o.builder.zeroInitValue(inst_llvm_ty);
-            const rem_nonzero = try self.wip.icmp(.ne, rem, zero, "");
-            const correction = try self.wip.select(.normal, rem_nonzero, div_sign_mask, zero, "");
-            return self.wip.bin(.@"add nsw", div, correction, "");
+            const div = try self.wip.bin(.sdiv, lhs, rhs, "divFloor.div");
+            const rem = try self.wip.bin(.srem, lhs, rhs, "divFloor.rem");
+            const rhs_sign = try self.wip.bin(.@"and", rhs, smin, "divFloor.rhs_sign");
+            const rem_xor_rhs_sign = try self.wip.bin(.xor, rem, rhs_sign, "divFloor.rem_xor_rhs_sign");
+            const need_correction = try self.wip.icmp(.ugt, rem_xor_rhs_sign, smin, "divFloor.need_correction");
+            const correction = try self.wip.cast(.sext, need_correction, inst_llvm_ty, "divFloor.correction");
+            return self.wip.bin(.@"add nsw", div, correction, "divFloor");
         }
         return self.wip.bin(.udiv, lhs, rhs, "");
     }
@@ -8642,19 +8621,36 @@ pub const FuncGen = struct {
             return self.wip.select(fast, ltz, c, a, "");
         }
         if (scalar_ty.isSignedInt(zcu)) {
-            const bit_size_minus_one = try o.builder.splatValue(inst_llvm_ty, try o.builder.intConst(
+            const ExpectedContents = [std.math.big.int.calcTwosCompLimbCount(256)]std.math.big.Limb;
+            var stack align(@max(
+                @alignOf(std.heap.StackFallbackAllocator(0)),
+                @alignOf(ExpectedContents),
+            )) = std.heap.stackFallback(@sizeOf(ExpectedContents), self.gpa);
+            const allocator = stack.get();
+
+            const scalar_bits = inst_llvm_ty.scalarBits(&o.builder);
+            var smin_big_int: std.math.big.int.Mutable = .{
+                .limbs = try allocator.alloc(
+                    std.math.big.Limb,
+                    std.math.big.int.calcTwosCompLimbCount(scalar_bits),
+                ),
+                .len = undefined,
+                .positive = undefined,
+            };
+            defer allocator.free(smin_big_int.limbs);
+            smin_big_int.setTwosCompIntLimit(.min, .signed, scalar_bits);
+            const smin = try o.builder.splatValue(inst_llvm_ty, try o.builder.bigIntConst(
                 inst_llvm_ty.scalarType(&o.builder),
-                inst_llvm_ty.scalarBits(&o.builder) - 1,
+                smin_big_int.toConst(),
             ));
 
-            const rem = try self.wip.bin(.srem, lhs, rhs, "");
-            const div_sign = try self.wip.bin(.xor, lhs, rhs, "");
-            const div_sign_mask = try self.wip.bin(.ashr, div_sign, bit_size_minus_one, "");
-            const rhs_masked = try self.wip.bin(.@"and", rhs, div_sign_mask, "");
+            const rem = try self.wip.bin(.srem, lhs, rhs, "mod.rem");
+            const rhs_sign = try self.wip.bin(.@"and", rhs, smin, "mod.rhs_sign");
+            const rem_xor_rhs_sign = try self.wip.bin(.xor, rem, rhs_sign, "mod.rem_xor_rhs_sign");
+            const need_correction = try self.wip.icmp(.ugt, rem_xor_rhs_sign, smin, "mod.need_correction");
             const zero = try o.builder.zeroInitValue(inst_llvm_ty);
-            const rem_nonzero = try self.wip.icmp(.ne, rem, zero, "");
-            const correction = try self.wip.select(.normal, rem_nonzero, rhs_masked, zero, "");
-            return self.wip.bin(.@"add nsw", rem, correction, "");
+            const correction = try self.wip.select(.normal, need_correction, rhs, zero, "mod.correction");
+            return self.wip.bin(.@"add nsw", correction, rem, "mod");
         }
         return self.wip.bin(.urem, lhs, rhs, "");
     }
